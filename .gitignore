@@ -1,3 +1,4 @@
 *.env
+*pass
 *.log
 *bkp
