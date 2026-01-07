@@ -7,8 +7,11 @@ Este documento descreve o funcionamento da rotina de backup automatizada do Mong
 ## Arquivos Envolvidos
 
 - **`bkp-final.sh`**: Script principal de backup
-- **`.env`**: Arquivo de configuração com credenciais e variáveis sensíveis
-- **`.openssl_pass`**: Arquivo com a senha de criptografia
+- **`.env`**: Arquivo de configuração com credenciais e variáveis sensíveis (não versionado)
+- **`.env.template`**: Template para criação do arquivo `.env`
+- **`.openssl_pass`**: Arquivo com a senha de criptografia (não versionado)
+- **`.openssl_pass.template`**: Template para criação do arquivo `.openssl_pass`
+- **`.gitignore`**: Arquivo que define quais arquivos devem ser ignorados pelo Git (arquivos sensíveis, logs e backups)
 
 ## Arquitetura do Cluster MongoDB
 
@@ -16,7 +19,7 @@ Este documento descreve o funcionamento da rotina de backup automatizada do Mong
 
 Foi adicionado um nó específico ao cluster MongoDB exclusivamente para realizar backups:
 
-- **Hostname**: `mongodb-backup.s4bdigital.net`
+- **Hostname**: `mongodb-backup.<dominio>`
 - **IP**: `10.250.50.114`
 - **Porta**: `37017`
 - **Função**: Nó secundário dedicado exclusivamente para backups
@@ -27,7 +30,7 @@ O nó foi adicionado ao cluster com as seguintes características:
 
 ```javascript
 rs.add({
-  host: "mongodb-backup.s4bdigital.net:37017", 
+  host: "mongodb-backup.<dominio>:37017", 
   priority: 0,      // Prioridade zero - nunca será eleito como primário
   hidden: true,     // Nó oculto - não aparece nas queries normais
   votes: 0          // Sem direito a voto - não participa da eleição de primário
@@ -74,6 +77,7 @@ Esta configuração garante que o nó de backup não interfira na operação nor
 
 #### Criptografia
 - **`PASS_FILE`**: `/.openssl_pass` - Arquivo contendo a senha para criptografia OpenSSL (deve ter permissões restritas: chmod 600)
+  - Um template está disponível em `.openssl_pass.template` para facilitar a configuração inicial
 
 #### AWS S3
 - **`S3_BUCKET_NAME`**: `backup-mongodb-superbid` - Nome do bucket S3
@@ -84,19 +88,24 @@ Esta configuração garante que o nó de backup não interfira na operação nor
 
 ### Variáveis do Arquivo `.env`
 
-O arquivo `.env` contém as credenciais e configurações sensíveis:
+O arquivo `.env` contém as credenciais e configurações sensíveis. Um template está disponível em `.env.template` para facilitar a configuração inicial.
+
+**Estrutura do arquivo `.env`**:
 
 ```bash
 MONGO_USER="<user_backup>"              # Usuário do MongoDB
-MONGO_PASS="<passord>"        # Senha do MongoDB
-AUTH_DB="admin"                      # Banco de autenticação
-REPLICA_SET_NAME="rsGARR"            # Nome do Replica Set
+MONGO_PASS="<password>"                 # Senha do MongoDB
+AUTH_DB="<base>"                        # Banco de autenticação
+REPLICA_SET_NAME="<replica set>"        # Nome do Replica Set
 
-export AWS_ACCESS_KEY_ID="..."       # Chave de acesso AWS
-export AWS_SECRET_ACCESS_KEY="..."   # Chave secreta AWS
+export AWS_ACCESS_KEY_ID="..."          # Chave de acesso AWS
+export AWS_SECRET_ACCESS_KEY="..."      # Chave secreta AWS
 ```
 
-**⚠️ IMPORTANTE**: O arquivo `.env` contém informações sensíveis e não deve ser versionado ou compartilhado.
+**⚠️ IMPORTANTE**: 
+- O arquivo `.env` contém informações sensíveis e não deve ser versionado ou compartilhado
+- Use o template `.env.template` como base para criar seu arquivo `.env`
+- Certifique-se de que o arquivo tenha permissões restritas (`chmod 600`)
 
 ## Fluxo de Execução
 
@@ -139,11 +148,14 @@ O backup compactado é criptografado antes do upload:
 - **Algoritmo**: AES-256-CBC (Advanced Encryption Standard com chave de 256 bits)
 - **Comando**: `openssl enc -aes-256-cbc -salt -in "$FINAL_FILE" -out "$FINAL_FILE.enc" --pass file:"$PASS_FILE"`
 - **Arquivo de senha**: `$SCRIPT_DIR/.openssl_pass` - Arquivo contendo a senha de criptografia
+  - Um template está disponível em `.openssl_pass.template` para facilitar a configuração inicial
 - **Arquivo criptografado**: `mongodb_dump_YYYYMMDD_HHMMSS.tar.enc`
 - **Validação**: Verifica se o arquivo de senha existe antes de criptografar
 - **Limpeza**: Remove o arquivo original `.tar` após criptografia bem-sucedida (mantém apenas o `.enc`)
 
-**⚠️ IMPORTANTE**: O arquivo `$SCRIPT_DIR/.openssl_pass` deve ter permissões restritas (chmod 600) e conter apenas a senha de criptografia.
+**⚠️ IMPORTANTE**: 
+- O arquivo `$SCRIPT_DIR/.openssl_pass` deve ter permissões restritas (chmod 600) e conter apenas a senha de criptografia
+- Use o template `.openssl_pass.template` como base para criar seu arquivo de senha
 
 ### 5. Upload para Amazon S3
 
@@ -335,6 +347,8 @@ A rotina de backup é monitorada pelo **New Relic** para acompanhamento de:
 11. **Rotação de Logs**: Logs são rotacionados automaticamente quando excedem 100MB, mantendo os últimos 5 arquivos
 12. **Segurança**: As credenciais estão no arquivo `.env`, que deve ter permissões restritas (chmod 600)
 13. **Monitoramento**: A rotina é monitorada pelo New Relic para alertas e acompanhamento de métricas
+14. **Versionamento**: Arquivos sensíveis (`.env`, `.openssl_pass`, logs e backups) são ignorados pelo Git através do `.gitignore`
+15. **Templates**: Templates estão disponíveis (`.env.template` e `.openssl_pass.template`) para facilitar a configuração inicial do projeto
 
 ## Melhorias Implementadas
 
