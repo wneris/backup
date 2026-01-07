@@ -19,7 +19,7 @@ Este documento descreve o funcionamento da rotina de backup automatizada do Mong
 
 Foi adicionado um nó específico ao cluster MongoDB exclusivamente para realizar backups:
 
-- **Hostname**: `mongodb-backup.s4bdigital.net`
+- **Hostname**: `mongodb-backup.<dominio>`
 - **IP**: `10.250.50.114`
 - **Porta**: `37017`
 - **Função**: Nó secundário dedicado exclusivamente para backups
@@ -30,7 +30,7 @@ O nó foi adicionado ao cluster com as seguintes características:
 
 ```javascript
 rs.add({
-  host: "mongodb-backup.s4bdigital.net:37017", 
+  host: "mongodb-backup.<dominio>:37017", 
   priority: 0,      // Prioridade zero - nunca será eleito como primário
   hidden: true,     // Nó oculto - não aparece nas queries normais
   votes: 0          // Sem direito a voto - não participa da eleição de primário
