@@ -5,6 +5,7 @@
 ## v2 - 17/12/2025 - criacao do arquivo de variável .env
 ## v3 - 18/12/2025 - correção para funcionar via cron (caminho absoluto do .env)
 ## v4 - 18/12/2025 - adicionado verificação de espaço em disco, integridade do backup e rotação de logs
+## v6 - 09/06/2026 - retenção local por quantidade: apenas os 2 arquivos .enc mais recentes
 #
 #######################################################################################
 #set +x
@@ -22,7 +23,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 BACKUP_NAME="mongodb_dump_$TIMESTAMP"
 FINAL_FILE="$BACKUP_DIR_LOCAL/$BACKUP_NAME.tar"
 
-RETENTION_DAYS=2
+RETENTION_ENCRYPTED_COUNT=2  # Número de arquivos .tar.enc a manter localmente
 MIN_DISK_SPACE_GB=70  # Espaço mínimo necessário em GB
 LOG_FILE="/var/log/mongodb_backup.log"
 LOG_MAX_SIZE_MB=100   # Tamanho máximo do log em MB antes de rotacionar
@@ -214,8 +215,24 @@ fi
 # ----------------------------------------------------
 # 6. Limpeza local
 # ----------------------------------------------------
-echo "Limpando backups locais antigos (+$RETENTION_DAYS dias)..."
-find "$BACKUP_DIR_LOCAL" -type f \( -name "mongodb_dump_*.tar" -o -name "mongodb_dump_*.tar.enc" \) -mtime +$RETENTION_DAYS -print -delete
+echo "Limpando backups locais antigos (mantendo $RETENTION_ENCRYPTED_COUNT arquivos .enc)..."
+
+# Remover subpastas e arquivos .tar órfãos (mantém apenas .enc)
+find "$BACKUP_DIR_LOCAL" -maxdepth 1 -type d -name "mongodb_dump_*" -print -exec rm -rf {} +
+find "$BACKUP_DIR_LOCAL" -maxdepth 1 -type f -name "mongodb_dump_*.tar" -print -delete
+
+# Manter apenas os últimos N arquivos criptografados
+shopt -s nullglob
+ENC_FILES=("$BACKUP_DIR_LOCAL"/mongodb_dump_*.tar.enc)
+if [ ${#ENC_FILES[@]} -gt "$RETENTION_ENCRYPTED_COUNT" ]; then
+  mapfile -t OLD_ENC_FILES < <(ls -t "${ENC_FILES[@]}" | tail -n +$((RETENTION_ENCRYPTED_COUNT + 1)))
+  for f in "${OLD_ENC_FILES[@]}"; do
+    echo "Removendo backup criptografado antigo: $f"
+    rm -f "$f"
+  done
+fi
+shopt -u nullglob
+
 echo "[OK] Limpeza concluída."
 echo "Fim do processo: $(date +'%Y-%m-%d %H:%M:%S')"
 echo "----------------------------------------------------"
