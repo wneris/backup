@@ -6,6 +6,7 @@
 ## v3 - 18/12/2025 - correção para funcionar via cron (caminho absoluto do .env)
 ## v4 - 18/12/2025 - adicionado verificação de espaço em disco, integridade do backup e rotação de logs
 ## v6 - 09/06/2026 - retenção local por quantidade: apenas os 2 arquivos .enc mais recentes
+## v7 - 23/07/2026 - mongodump com conexão direta no nó de backup e --numParallelCollections=1
 #
 #######################################################################################
 #set +x
