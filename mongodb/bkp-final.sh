@@ -7,6 +7,7 @@
 ## v4 - 18/12/2025 - adicionado verificação de espaço em disco, integridade do backup e rotação de logs
 ## v6 - 09/06/2026 - retenção local por quantidade: apenas os 2 arquivos .enc mais recentes
 ## v7 - 23/07/2026 - mongodump com conexão direta no nó de backup e --numParallelCollections=1
+## v8 - 23/07/2026 - dump por collection com retry; collections grandes em lotes por _id (ObjectId)
 #
 #######################################################################################
 #set +x
@@ -18,6 +19,8 @@ BACKUP_DIR_REMOTO="/mnt/nfs/mongodb/daily/"
 REMOTE_HOST="backup-server-ip"
 
 MONGO_HOSTS="10.250.50.114:37017"
+MONGO_BIN="${MONGO_BIN:-/usr/bin/mongo}"
+MONGODUMP_BIN="${MONGODUMP_BIN:-/usr/bin/mongodump}"
 MONGODB_URI="mongodb://${MONGO_USER}:${MONGO_PASS}@${MONGO_HOSTS}/?authSource=${AUTH_DB}&replicaSet=${REPLICA_SET_NAME}&readPreference=secondary"
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -29,6 +32,20 @@ MIN_DISK_SPACE_GB=70  # Espaço mínimo necessário em GB
 LOG_FILE="/var/log/mongodb_backup.log"
 LOG_MAX_SIZE_MB=100   # Tamanho máximo do log em MB antes de rotacionar
 LOG_BACKUP_COUNT=5    # Número de logs de backup a manter
+
+# Dump resiliente
+DUMP_MAX_RETRIES="${DUMP_MAX_RETRIES:-5}"
+DUMP_RETRY_SLEEP_SEC="${DUMP_RETRY_SLEEP_SEC:-60}"
+CHUNKED_COLLECTIONS="${CHUNKED_COLLECTIONS:-loginAudit logRoot}"
+CHUNK_DOC_THRESHOLD="${CHUNK_DOC_THRESHOLD:-10000000}"  # auto-chunk se estimated count >= este valor
+NUM_CHUNKS="${NUM_CHUNKS:-48}"  # lotes por faixa temporal de ObjectId
+BACKUP_DATABASES="${BACKUP_DATABASES:-admin GARR_MONGO}"  # fallback se listDatabases falhar
+# mongo shell antigo: --host e --port separados
+MONGO_HOST_ONLY="${MONGO_HOSTS%%:*}"
+MONGO_PORT_ONLY="${MONGO_HOSTS##*:}"
+if [ "$MONGO_HOST_ONLY" = "$MONGO_HOSTS" ] || [ -z "$MONGO_PORT_ONLY" ]; then
+  MONGO_PORT_ONLY="27017"
+fi
 
 # --- AWS ---
 S3_BUCKET_NAME=backup-mongodb-superbid
@@ -99,23 +116,320 @@ echo "[OK] Espaço em disco suficiente: ${AVAILABLE_SPACE_GB}GB disponível (mí
 
 
 # ----------------------------------------------------
+# Helpers de dump (retry + lotes por _id)
+# ----------------------------------------------------
+mongo_eval() {
+  local js="$1"
+  local raw err rc
+  raw=$(mktemp)
+  err=$(mktemp)
+
+  # Shell antigo: --host e --port separados (não usar host:port).
+  "$MONGO_BIN" --quiet \
+    --host "${MONGO_HOST_ONLY}" \
+    --port "${MONGO_PORT_ONLY}" \
+    --username "${MONGO_USER}" \
+    --password "${MONGO_PASS}" \
+    --authenticationDatabase "${AUTH_DB}" \
+    --eval "$js" >"$raw" 2>"$err"
+  rc=$?
+
+  grep -vE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' "$raw" | grep -vE '^[[:space:]]*$' || true
+
+  if [ "$rc" -ne 0 ] && [ -s "$err" ]; then
+    echo "[AVISO] mongo --eval exit=$rc; stderr:" >&2
+    tail -n 15 "$err" >&2
+  fi
+  rm -f "$raw" "$err"
+  return "$rc"
+}
+
+list_databases() {
+  # Usuário de backup muitas vezes não tem listDatabases; usamos lista explícita.
+  echo "[INFO] Databases do backup: ${BACKUP_DATABASES}" >&2
+  echo "$BACKUP_DATABASES" | tr ' ' '\n' | grep -vE '^[[:space:]]*$'
+}
+
+list_collections() {
+  local db_name="$1"
+  local listed
+  listed=$(mongo_eval "
+    print('__COLL_START__');
+    try {
+      db.getSiblingDB('${db_name}').getCollectionNames().forEach(function(c) {
+        if (c.indexOf('system.') === 0 && c !== 'system.users' && c !== 'system.roles' && c !== 'system.version') {
+          return;
+        }
+        print(c);
+      });
+    } catch (e) {
+      print('__COLL_ERROR__');
+      print(e);
+    }
+    print('__COLL_END__');
+  " | sed -n '/__COLL_START__/,/__COLL_END__/p' \
+    | grep -vE '^__(COLL_START|COLL_END|COLL_ERROR)__$' \
+    | grep -vE '@src/mongo' \
+    | grep -vE '^[[:space:]]*$' \
+    | grep -E '^[A-Za-z0-9._-]+$' || true)
+
+  if [ -n "$listed" ]; then
+    echo "$listed"
+    return 0
+  fi
+
+  # Fallback: só as collections grandes conhecidas (serão dumpadas em lotes)
+  echo "[AVISO] getCollectionNames falhou em ${db_name}; usando CHUNKED_COLLECTIONS" >&2
+  echo "$CHUNKED_COLLECTIONS" | tr ' ' '\n' | grep -vE '^[[:space:]]*$'
+}
+
+retry_cmd() {
+  local attempt=1
+  local rc=0
+  while [ "$attempt" -le "$DUMP_MAX_RETRIES" ]; do
+    # Não usar `if cmd; then` — o exit code do if vira 0 e mascara a falha real.
+    "$@"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      return 0
+    fi
+    if [ "$attempt" -ge "$DUMP_MAX_RETRIES" ]; then
+      return "$rc"
+    fi
+    echo "[AVISO] Falha (exit $rc). Retry ${attempt}/${DUMP_MAX_RETRIES} em ${DUMP_RETRY_SLEEP_SEC}s..."
+    sleep "$DUMP_RETRY_SLEEP_SEC"
+    attempt=$((attempt + 1))
+  done
+  return "$rc"
+}
+
+should_chunk_collection() {
+  local coll="$1"
+  local count="$2"
+  local c
+  for c in $CHUNKED_COLLECTIONS; do
+    if [ "$c" = "$coll" ]; then
+      return 0
+    fi
+  done
+  if [ -n "$count" ] && [ "$count" -ge "$CHUNK_DOC_THRESHOLD" ] 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+mongodump_collection() {
+  local db_name="$1"
+  local coll_name="$2"
+  local out_dir="$3"
+  shift 3
+  # args extras: --query '...'
+  "$MONGODUMP_BIN" \
+    --host "${MONGO_HOSTS}" \
+    --username "${MONGO_USER}" \
+    --password "${MONGO_PASS}" \
+    --authenticationDatabase "${AUTH_DB}" \
+    --db "$db_name" \
+    --collection "$coll_name" \
+    --out "$out_dir" \
+    "$@"
+}
+
+dump_collection_simple() {
+  local db_name="$1"
+  local coll_name="$2"
+  local out_dir="$3"
+
+  echo ">>> Dump: ${db_name}.${coll_name}"
+  retry_cmd mongodump_collection "$db_name" "$coll_name" "$out_dir" --gzip
+}
+
+# Gera linhas: <epoch_start> <epoch_end_exclusive>
+oid_time_chunks() {
+  local db_name="$1"
+  local coll_name="$2"
+  mongo_eval "
+    print('__CHUNK_START__');
+    var coll = db.getSiblingDB('${db_name}').getCollection('${coll_name}');
+    var minDoc = coll.find().sort({_id: 1}).limit(1).toArray()[0];
+    var maxDoc = coll.find().sort({_id: -1}).limit(1).toArray()[0];
+    if (!minDoc || !maxDoc || !minDoc._id || !minDoc._id.getTimestamp) {
+      print('__CHUNK_END__');
+      quit(0);
+    }
+    var t0 = Math.floor(minDoc._id.getTimestamp().getTime() / 1000);
+    var t1 = Math.floor(maxDoc._id.getTimestamp().getTime() / 1000) + 1;
+    var n = ${NUM_CHUNKS};
+    var step = Math.max(1, Math.ceil((t1 - t0) / n));
+    for (var t = t0; t < t1; t += step) {
+      var end = t + step;
+      if (end > t1) end = t1;
+      print(t + ' ' + end);
+    }
+    print('__CHUNK_END__');
+  " | sed -n '/__CHUNK_START__/,/__CHUNK_END__/p' | grep -E '^[0-9]+ [0-9]+$' || true
+}
+
+oid_hex_from_time() {
+  # ObjectId.createFromTime equivalent: 4-byte time + 8 zero bytes
+  printf '%08x0000000000000000' "$1"
+}
+
+dump_collection_chunked() {
+  local db_name="$1"
+  local coll_name="$2"
+  local out_dir="$3"
+  local chunk_tmp query start_hex end_hex start_ts end_ts chunk_idx chunk_out
+  local bson_src metadata_src bson_dst metadata_dst
+  local chunks_file
+
+  echo ">>> Dump em lotes (_id/ObjectId): ${db_name}.${coll_name} (${NUM_CHUNKS} faixas alvo)"
+
+  chunks_file=$(mktemp)
+  if ! oid_time_chunks "$db_name" "$coll_name" > "$chunks_file"; then
+    echo "[AVISO] Não foi possível calcular lotes por ObjectId para ${db_name}.${coll_name}. Fallback dump simples."
+    rm -f "$chunks_file"
+    dump_collection_simple "$db_name" "$coll_name" "$out_dir"
+    return $?
+  fi
+
+  if [ ! -s "$chunks_file" ]; then
+    echo "[AVISO] Collection vazia ou _id sem ObjectId: ${db_name}.${coll_name}. Fallback dump simples."
+    rm -f "$chunks_file"
+    dump_collection_simple "$db_name" "$coll_name" "$out_dir"
+    return $?
+  fi
+
+  chunk_tmp=$(mktemp -d)
+  mkdir -p "${out_dir}/${db_name}"
+  bson_dst="${out_dir}/${db_name}/${coll_name}.bson"
+  metadata_dst="${out_dir}/${db_name}/${coll_name}.metadata.json"
+  rm -f "$bson_dst" "${bson_dst}.gz" "$metadata_dst"
+  : > "$bson_dst"
+
+  chunk_idx=0
+  while read -r start_ts end_ts; do
+    [ -z "$start_ts" ] && continue
+    chunk_idx=$((chunk_idx + 1))
+    start_hex=$(oid_hex_from_time "$start_ts")
+    end_hex=$(oid_hex_from_time "$end_ts")
+    query=$(printf '{"_id":{"$gte":{"$oid":"%s"},"$lt":{"$oid":"%s"}}}' "$start_hex" "$end_hex")
+    chunk_out="${chunk_tmp}/chunk_${chunk_idx}"
+    rm -rf "$chunk_out"
+    mkdir -p "$chunk_out"
+
+    echo "    lote ${chunk_idx}: _id >= ${start_hex} < ${end_hex}"
+    if ! retry_cmd mongodump_collection "$db_name" "$coll_name" "$chunk_out" --query "$query"; then
+      echo "[ERRO] Falha no lote ${chunk_idx} de ${db_name}.${coll_name}"
+      rm -rf "$chunk_tmp" "$chunks_file"
+      return 1
+    fi
+
+    bson_src="${chunk_out}/${db_name}/${coll_name}.bson"
+    metadata_src="${chunk_out}/${db_name}/${coll_name}.metadata.json"
+
+    if [ -f "$bson_src" ]; then
+      cat "$bson_src" >> "$bson_dst"
+    fi
+    if [ -f "$metadata_src" ] && [ ! -f "$metadata_dst" ]; then
+      cp "$metadata_src" "$metadata_dst"
+    fi
+    rm -rf "$chunk_out"
+  done < "$chunks_file"
+
+  rm -f "$chunks_file"
+  rm -rf "$chunk_tmp"
+
+  if [ -f "$bson_dst" ]; then
+    gzip -f "$bson_dst"
+  fi
+  echo "[OK] Lotes concluídos: ${db_name}.${coll_name} (${chunk_idx} lotes)"
+  return 0
+}
+
+mongodump_db() {
+  local db_name="$1"
+  local out_dir="$2"
+  shift 2
+
+  echo ">>> Dump DB: ${db_name} $*"
+  retry_cmd "$MONGODUMP_BIN" \
+    --host "${MONGO_HOSTS}" \
+    --username "${MONGO_USER}" \
+    --password "${MONGO_PASS}" \
+    --authenticationDatabase "${AUTH_DB}" \
+    --db "$db_name" \
+    --numParallelCollections=1 \
+    --gzip \
+    --out "$out_dir" \
+    "$@"
+}
+
+mongodump_db_excluding() {
+  local db_name="$1"
+  local out_dir="$2"
+  shift 2
+  local exclude_args=()
+  local coll
+  for coll in "$@"; do
+    [ -n "$coll" ] || continue
+    exclude_args+=(--excludeCollection "$coll")
+  done
+  mongodump_db "$db_name" "$out_dir" "${exclude_args[@]}"
+}
+
+dump_all_collections() {
+  local out_dir="$1"
+  local db_name coll_name
+  local db_list
+
+  db_list=$(list_databases)
+  if [ -z "$db_list" ]; then
+    echo "[ERRO] Não foi possível obter lista de databases."
+    return 1
+  fi
+  echo "Databases: $(echo $db_list | tr '\n' ' ')"
+
+  mkdir -p "$out_dir"
+
+  for db_name in $db_list; do
+    if [ "$db_name" = "admin" ]; then
+      if ! mongodump_db "$db_name" "$out_dir"; then
+        echo "[ERRO] Falha no dump de ${db_name}"
+        return 1
+      fi
+      continue
+    fi
+
+    # App DB: dump normal excluindo collections gigantes, depois lotes nelas
+    echo "[INFO] ${db_name}: dump base excluindo [${CHUNKED_COLLECTIONS}], depois lotes nas grandes"
+    # shellcheck disable=SC2086
+    if ! mongodump_db_excluding "$db_name" "$out_dir" $CHUNKED_COLLECTIONS; then
+      echo "[ERRO] Falha no dump base de ${db_name}"
+      return 1
+    fi
+
+    for coll_name in $CHUNKED_COLLECTIONS; do
+      echo "Collection grande: ${db_name}.${coll_name}"
+      if ! dump_collection_chunked "$db_name" "$coll_name" "$out_dir"; then
+        return 1
+      fi
+    done
+  done
+  return 0
+}
+
+# ----------------------------------------------------
 # 2. Execução do Backup
 # ----------------------------------------------------
 echo "Criando diretório local temporário: $BACKUP_DIR_LOCAL"
 mkdir -p "$BACKUP_DIR_LOCAL"
 
-echo "Iniciando mongodump no nó Secundário (conexão direta, paralelismo 1)..."
-/usr/bin/mongodump  \
-  --host "${MONGO_HOSTS}" \
-  --username "${MONGO_USER}" \
-  --password "${MONGO_PASS}" \
-  --authenticationDatabase "${AUTH_DB}" \
-  --numParallelCollections=1 \
-  --gzip \
-  --out "$BACKUP_DIR_LOCAL/$BACKUP_NAME"
+echo "Iniciando dump resiliente (conexão direta, 1 collection por vez, retry=${DUMP_MAX_RETRIES}, lotes=${NUM_CHUNKS})..."
+echo "Collections forçadas em lotes: ${CHUNKED_COLLECTIONS}"
+echo "Auto-lote se count >= ${CHUNK_DOC_THRESHOLD}"
 
-
-if [ $? -ne 0 ]; then
+if ! dump_all_collections "$BACKUP_DIR_LOCAL/$BACKUP_NAME"; then
   echo "[ERRO] O mongodump falhou em $(date). Abortando script."
   exit 1
 fi
