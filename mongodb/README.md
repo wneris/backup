@@ -51,6 +51,9 @@ Esta configuração garante que o nó de backup não interfira na operação nor
 - **v3** (18/12/2025): Correção para funcionar via cron (caminho absoluto do `.env`)
 - **v4** (18/12/2025): Adicionado verificação de espaço em disco, verificação de integridade do backup e rotação de logs
 - **v5** (05/01/2025): Adicionado criptografia AES-256-CBC dos backups antes do upload ao S3
+- **v6** (09/06/2026): Retenção local por quantidade — mantém apenas os 2 arquivos `.enc` mais recentes
+- **v7** (23/07/2026): `mongodump` com conexão direta no nó de backup (`host:porta`, sem discovery do replica set)
+- **v8** (23/07/2026): Dump resiliente — retry, databases explícitos e collections grandes em lotes por ObjectId
 
 ## Configurações
 
@@ -62,11 +65,20 @@ Esta configuração garante que o nó de backup não interfira na operação nor
 - **`REMOTE_HOST`**: `backup-server-ip` - Host do servidor de backup
 
 #### MongoDB
-- **`MONGO_HOSTS`**: `10.250.50.114:37017` - Host e porta do MongoDB
-- **`MONGODB_URI`**: URI de conexão construída dinamicamente usando variáveis do `.env`
+- **`MONGO_HOSTS`**: `10.250.50.114:37017` - Host e porta do nó dedicado de backup (conexão direta)
+- **`MONGO_BIN`**: `/usr/bin/mongo` - Shell usado para calcular lotes de ObjectId (`--host` e `--port` separados)
+- **`MONGODUMP_BIN`**: `/usr/bin/mongodump` - Binário do dump
+- **`BACKUP_DATABASES`**: `admin GARR_MONGO` - Databases incluídos no backup (lista explícita; o usuário de backup tipicamente não tem `listDatabases`)
+
+#### Dump resiliente
+- **`DUMP_MAX_RETRIES`**: `5` - Tentativas por lote/collection em caso de falha transitória
+- **`DUMP_RETRY_SLEEP_SEC`**: `60` - Espera entre retries (segundos)
+- **`CHUNKED_COLLECTIONS`**: `loginAudit logRoot` - Collections dumpadas em lotes por faixa temporal de `_id` (ObjectId)
+- **`NUM_CHUNKS`**: `48` - Quantidade alvo de lotes por collection grande (aumentar se ainda ocorrer `Closed explicitly`)
+- **`CHUNK_DOC_THRESHOLD`**: `10000000` - Reservado para auto-lote por contagem (estratégia atual força lote via `CHUNKED_COLLECTIONS`)
 
 #### Retenção
-- **`RETENTION_DAYS`**: `2` - Número de dias para manter backups locais antes de excluir
+- **`RETENTION_ENCRYPTED_COUNT`**: `2` - Quantidade de arquivos `.tar.enc` a manter localmente
 - **Retenção S3**: `7 dias` - Configurado diretamente no bucket S3 (não configurável via script)
 
 #### Verificações e Logs
@@ -117,21 +129,26 @@ export AWS_SECRET_ACCESS_KEY="..."      # Chave secreta AWS
 4. Valida se a variável `MONGODB_URI` está definida
 5. **Rotaciona logs** se o arquivo de log exceder 100MB (mantém os últimos 5 arquivos)
 6. Configura o redirecionamento de logs para `/var/log/mongodb_backup.log`
-7. **Verifica espaço em disco disponível** - Aborta se houver menos de 50GB disponíveis
+7. **Verifica espaço em disco disponível** - Aborta se houver menos de 70GB disponíveis
 
-### 2. Execução do Backup (`mongodump`)
+### 2. Execução do Backup (`mongodump` resiliente)
 
-O script executa o `mongodump` com as seguintes características:
+O dump **não** usa mais um único `mongodump` de todo o cluster. A estratégia atual é:
 
-- **Host**: Conecta ao Replica Set usando o formato `${RS_NAME}/${MONGO_HOSTS}` (nó dedicado: `mongodb-backup.s4bdigital.net:37017`)
-- **Autenticação**: Utiliza as credenciais do arquivo `.env`
-- **Read Preference**: `secondary` - Lê do nó secundário dedicado para não impactar o primário
-- **Compactação**: `--gzip` - Comprime os dados durante o dump
-- **Saída**: Salva em `$BACKUP_DIR_LOCAL/$BACKUP_NAME`
+1. **Conexão direta** em `MONGO_HOSTS` (`10.250.50.114:37017`) — sem prefixo de replica set / discovery (adequado ao nó `hidden`)
+2. **`admin`**: `mongodump --db admin` completo (users/roles), com `--gzip` e `--numParallelCollections=1`
+3. **`GARR_MONGO`** (e demais DBs em `BACKUP_DATABASES`, exceto `admin`):
+   - Dump base com `--excludeCollection` para cada collection em `CHUNKED_COLLECTIONS` (`loginAudit`, `logRoot`)
+   - Em seguida, cada collection grande é dumpada em **lotes por faixa temporal de ObjectId** (`NUM_CHUNKS`, padrão 48)
+   - Cada lote/collection tem **retry** (`DUMP_MAX_RETRIES` / `DUMP_RETRY_SLEEP_SEC`)
+   - Os `.bson` dos lotes são concatenados e compactados em `collection.bson.gz` + `collection.metadata.json`
+4. O shell `mongo` (`MONGO_BIN`) é usado apenas para calcular min/max `_id` e as faixas dos lotes (`--host` + `--port` separados, compatível com shell antigo)
 
 **Nome do Backup**: `mongodb_dump_YYYYMMDD_HHMMSS` (timestamp)
 
-**Nota**: O backup é realizado no nó dedicado `mongodb-backup`, que está configurado como secundário oculto e sem prioridade, garantindo que sempre esteja disponível para backups sem interferir na operação do cluster.
+**Por quê**: collections como `loginAudit` (~centenas de milhões de docs) geravam `Closed explicitly` em dump monolítico (getMore com lock wait longo). Lotes menores + retry reduzem a chance de abortar o backup inteiro.
+
+**Nota**: O backup é realizado no nó dedicado `mongodb-backup`, secundário oculto sem prioridade, sem interferir no primário.
 
 ### 3. Compactação
 
@@ -181,11 +198,10 @@ Após o upload, o script verifica a integridade do backup:
 
 ### 6. Limpeza Local
 
-O script remove backups locais antigos:
+O script remove artefatos locais antigos:
 
-- **Critério**: Arquivos com mais de `RETENTION_DAYS` (2 dias)
-- **Padrão**: `mongodb_dump_*.tar` e `mongodb_dump_*.tar.enc`
-- **Comando**: `find "$BACKUP_DIR_LOCAL" -type f \( -name "mongodb_dump_*.tar" -o -name "mongodb_dump_*.tar.enc" \) -mtime +$RETENTION_DAYS -print -delete`
+- **Subpastas** `mongodb_dump_*` e arquivos `.tar` órfãos
+- **Arquivos `.enc`**: mantém apenas os `RETENTION_ENCRYPTED_COUNT` (2) mais recentes
 
 ## Logs
 
@@ -206,28 +222,23 @@ O script implementa rotação automática de logs para evitar crescimento excess
 
 ```
 ----------------------------------------------------
-Início do Backup: 2025-12-18 10:00:00
+Início do Backup: 2026-07-23 10:00:00
 ----------------------------------------------------
 Verificando espaço em disco disponível...
 [OK] Espaço em disco suficiente: 150GB disponível (mínimo: 70GB)
 Criando diretório local temporário: /backup/mongodb_temp
-Iniciando mongodump no nó Secundário...
+Iniciando dump resiliente (conexão direta, 1 collection por vez, retry=5, lotes=48)...
+Collections forçadas em lotes: loginAudit logRoot
+Databases: admin GARR_MONGO
+>>> Dump DB: admin
+[INFO] GARR_MONGO: dump base excluindo [loginAudit logRoot], depois lotes nas grandes
+>>> Dump DB: GARR_MONGO --excludeCollection loginAudit --excludeCollection logRoot
+Collection grande: GARR_MONGO.loginAudit
+>>> Dump em lotes (_id/ObjectId): GARR_MONGO.loginAudit (48 faixas alvo)
+    lote 1: _id >= ... < ...
+[OK] Lotes concluídos: GARR_MONGO.loginAudit
 [OK] Backup concluído localmente.
-Compactando backup...
-[OK] Compactação concluída: /backup/mongodb_temp/mongodb_dump_20251218_100000.tar
-Criptografando backup...
-[OK] Criptografia concluída: /backup/mongodb_temp/mongodb_dump_20251218_100000.tar.enc
-[OK] Arquivo original removido após criptografia.
-Transferindo para o S3 em s3://backup-mongodb-superbid/prd/...
-Tamanho do arquivo local: 2.5GB
-MD5 local: a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6
-[OK] Upload para o S3 concluído com sucesso.
-Verificando integridade do backup no S3...
-Tamanho do arquivo no S3: 2.5GB
-[OK] Verificação de integridade: Tamanhos coincidem (2684354560 bytes)
-Limpando backups locais antigos (+2 dias)...
-[OK] Limpeza concluída.
-Fim do processo: 2025-12-18 10:15:00
+...
 ----------------------------------------------------
 ```
 
@@ -238,9 +249,9 @@ O script possui validações e tratamento de erros em pontos críticos:
 1. **Arquivo `.env` não encontrado**: Script aborta com código de saída 1
 2. **`MONGODB_URI` não definida**: Script aborta com código de saída 1
 3. **Espaço em disco insuficiente**: Script aborta com código de saída 1 se houver menos de 70GB disponíveis
-4. **Falha no `mongodump`**: Script aborta com código de saída 1
+4. **Falha no dump** (após retries): Script aborta com código de saída 1
 5. **Falha na compactação**: Script aborta com código de saída 1
-6. **Arquivo de senha não encontrado**: Script aborta com código de saída 1 se `/.openssl_pass` não existir
+6. **Arquivo de senha não encontrado**: Script aborta com código de saída 1 se `.openssl_pass` não existir
 7. **Falha na criptografia**: Script aborta com código de saída 1
 8. **Falha no upload S3**: Script aborta com código de saída 1
 9. **Falha na verificação de integridade**: Script aborta com código de saída 1 se os tamanhos não coincidirem
@@ -249,22 +260,19 @@ O script possui validações e tratamento de erros em pontos críticos:
 
 ### Ferramentas Necessárias
 
-- **`mongodump`**: Ferramenta do MongoDB para criação de backups
-  - Localização: `/usr/bin/mongodump`
+- **`mongodump`**: Ferramenta do MongoDB para criação de backups (`/usr/bin/mongodump`)
+- **`mongo`**: Shell para calcular faixas de ObjectId dos lotes (`/usr/bin/mongo`; `--host` e `--port` separados)
 - **`tar`**: Ferramenta de compactação
-- **`openssl`**: Ferramenta de criptografia
-  - Utilizado para criptografar backups com AES-256-CBC
-  - Requer arquivo de senha em `/.openssl_pass`
-- **`aws`**: CLI da Amazon Web Services
-  - Localização: `/usr/local/bin/aws`
-  - Requer configuração de credenciais no `.env`
+- **`gzip`**: Compactação dos BSON concatenados dos lotes
+- **`openssl`**: Criptografia AES-256-CBC (arquivo de senha em `$SCRIPT_DIR/.openssl_pass`)
+- **`aws`**: CLI AWS (`/usr/local/bin/aws`) com credenciais no `.env`
 
 ### Permissões Necessárias
 
 - Leitura/escrita no diretório `/backup/mongodb_temp`
 - Escrita no arquivo de log `/var/log/mongodb_backup.log`
-- Leitura do arquivo de senha `/.openssl_pass` (deve ter permissões restritas: chmod 600)
-- Acesso de leitura ao MongoDB (usuário `backupUser`)
+- Leitura do arquivo de senha `$SCRIPT_DIR/.openssl_pass` (chmod 600)
+- Acesso de leitura ao MongoDB no nó de backup (databases em `BACKUP_DATABASES`)
 - Permissões de escrita no bucket S3 `backup-mongodb-superbid`
 
 ## Descriptografia de Backups
@@ -334,42 +342,49 @@ A rotina de backup é monitorada pelo **New Relic** para acompanhamento de:
 
 ## Observações Importantes
 
-1. **Nó Dedicado de Backup**: O backup é realizado no nó dedicado `mongodb-backup`, configurado como secundário oculto sem prioridade e sem direito a voto, garantindo que nunca seja promovido a primário
-2. **Read Preference Secondary**: O backup é realizado no nó secundário para não impactar a performance do primário
-3. **Compactação Gzip**: O `mongodump` já comprime os dados durante o dump, reduzindo o tamanho dos arquivos
-4. **Criptografia**: Todos os backups são criptografados com AES-256-CBC antes do upload ao S3, garantindo segurança dos dados sensíveis
-5. **Arquivo de Senha**: O arquivo `/.openssl_pass` contém a senha de criptografia e deve ter permissões restritas (chmod 600) e ser mantido em local seguro
-6. **Remoção de Arquivo Original**: O arquivo `.tar` original é removido automaticamente após criptografia bem-sucedida, mantendo apenas o arquivo criptografado `.enc`
-7. **Retenção Local**: Apenas 2 dias de backups são mantidos localmente para economizar espaço em disco (tanto arquivos `.tar` quanto `.enc`)
-8. **Retenção S3**: 7 dias de backups são mantidos no S3 através de políticas de lifecycle do bucket (configuração não gerenciada pelo script)
-9. **Verificação de Espaço**: O script verifica automaticamente se há espaço suficiente (mínimo 70GB) antes de iniciar o backup
-10. **Verificação de Integridade**: Após o upload, o script valida que o arquivo foi transferido corretamente comparando tamanhos entre local e S3
-11. **Rotação de Logs**: Logs são rotacionados automaticamente quando excedem 100MB, mantendo os últimos 5 arquivos
-12. **Segurança**: As credenciais estão no arquivo `.env`, que deve ter permissões restritas (chmod 600)
-13. **Monitoramento**: A rotina é monitorada pelo New Relic para alertas e acompanhamento de métricas
-14. **Versionamento**: Arquivos sensíveis (`.env`, `.openssl_pass`, logs e backups) são ignorados pelo Git através do `.gitignore`
-15. **Templates**: Templates estão disponíveis (`.env.template` e `.openssl_pass.template`) para facilitar a configuração inicial do projeto
+1. **Nó Dedicado de Backup**: secundário oculto (`hidden: true`, `priority: 0`, `votes: 0`) — nunca vira primário
+2. **Conexão direta**: o dump usa `host:porta` do nó de backup, sem discovery do replica set (evita ler outro secundário)
+3. **Dump em lotes**: `loginAudit` e `logRoot` são dumpadas em faixas de ObjectId com retry, mitigando `Closed explicitly` por lock wait / idle de conexão
+4. **Databases explícitos**: `BACKUP_DATABASES` (padrão `admin GARR_MONGO`) — não depende de `listDatabases`
+5. **Compactação Gzip**: aplicada no dump e nos BSON concatenados dos lotes
+6. **Criptografia**: AES-256-CBC antes do upload ao S3
+7. **Arquivo de Senha**: `$SCRIPT_DIR/.openssl_pass` com permissões restritas (chmod 600)
+8. **Retenção Local**: mantém apenas `RETENTION_ENCRYPTED_COUNT` (2) arquivos `.enc`
+9. **Retenção S3**: 7 dias via lifecycle do bucket
+10. **Verificação de Espaço**: mínimo 70GB antes de iniciar
+11. **Verificação de Integridade**: compara tamanho local vs S3 após o upload
+12. **Rotação de Logs**: acima de 100MB, mantém os últimos 5 arquivos
+13. **Monitoramento**: New Relic sobre `/var/log/mongodb_backup.log`
+14. **Segurança / Git**: `.env`, `.openssl_pass`, logs e backups no `.gitignore`
 
 ## Melhorias Implementadas
 
 ### v4 (18/12/2025)
-1. ✅ **Verificação de Espaço em Disco**: Implementada verificação automática de espaço disponível (mínimo 70GB) antes de iniciar o backup
-2. ✅ **Verificação de Integridade**: Implementada validação do backup após upload ao S3, comparando tamanhos dos arquivos
-3. ✅ **Rotação de Logs**: Implementada rotação automática de logs quando excedem 100MB, mantendo os últimos 5 arquivos
-4. ✅ **Correção na Limpeza**: Padrão de busca corrigido para `*.tar` (corresponde ao formato real dos arquivos)
+1. ✅ Verificação de espaço em disco (mínimo 70GB)
+2. ✅ Verificação de integridade pós-upload S3
+3. ✅ Rotação automática de logs
+4. ✅ Correção na limpeza de arquivos `*.tar`
 
 ### v5 (05/01/2025)
-1. ✅ **Criptografia AES-256-CBC**: Implementada criptografia de todos os backups antes do upload ao S3
-2. ✅ **Validação de Arquivo de Senha**: Verificação automática da existência do arquivo de senha antes da criptografia
-3. ✅ **Remoção Automática**: Remoção do arquivo original não criptografado após criptografia bem-sucedida
-4. ✅ **Limpeza Atualizada**: Limpeza de arquivos antigos agora inclui tanto arquivos `.tar` quanto `.enc`
+1. ✅ Criptografia AES-256-CBC antes do S3
+2. ✅ Validação do arquivo de senha
+3. ✅ Remoção do `.tar` após criptografia
+4. ✅ Limpeza incluindo `.tar` e `.enc`
+
+### v6 (09/06/2026)
+1. ✅ Retenção local por quantidade (2 `.enc` mais recentes)
+
+### v7 / v8 (23/07/2026)
+1. ✅ Conexão direta no nó de backup
+2. ✅ Dump resiliente com retry
+3. ✅ Collections grandes (`loginAudit`, `logRoot`) em lotes por ObjectId
+4. ✅ Lista explícita de databases (`BACKUP_DATABASES`)
 
 ## Melhorias Futuras Sugeridas
 
-1. Implementar notificações (email/Slack) em caso de falha (além do monitoramento New Relic)
-2. Adicionar verificação de checksum MD5 completo entre arquivo local e S3 (atualmente apenas tamanho)
-3. Implementar métricas customizadas no New Relic para acompanhamento detalhado
-4. Adicionar opção de backup incremental para reduzir tempo e espaço
-5. Implementar rotação de senhas de criptografia com suporte a múltiplas versões
-6. Adicionar script de descriptografia para facilitar restauração de backups
-
+1. Notificações (email/Slack) em caso de falha (além do New Relic)
+2. Checksum MD5 completo entre local e S3 (hoje só tamanho)
+3. Métricas customizadas no New Relic
+4. Avaliar snapshot de filesystem no secundário para datasets muito grandes
+5. Rotação de senhas de criptografia com múltiplas versões
+6. Script auxiliar de descriptografia/restauração
