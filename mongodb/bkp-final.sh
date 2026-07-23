@@ -103,18 +103,15 @@ echo "[OK] Espaço em disco suficiente: ${AVAILABLE_SPACE_GB}GB disponível (mí
 echo "Criando diretório local temporário: $BACKUP_DIR_LOCAL"
 mkdir -p "$BACKUP_DIR_LOCAL"
 
-echo "Iniciando mongodump no nó Secundário..."
+echo "Iniciando mongodump no nó Secundário (conexão direta, paralelismo 1)..."
 /usr/bin/mongodump  \
-  --host "${RS_NAME}/${MONGO_HOSTS}" \
+  --host "${MONGO_HOSTS}" \
   --username "${MONGO_USER}" \
   --password "${MONGO_PASS}" \
   --authenticationDatabase "${AUTH_DB}" \
-  --readPreference secondary \
+  --numParallelCollections=1 \
   --gzip \
   --out "$BACKUP_DIR_LOCAL/$BACKUP_NAME"
-  #--db "GARR_MONGO" \
-  #--excludeCollection "logRoot" \
-  #--out "$BACKUP_DIR_LOCAL/$BACKUP_NAME"
 
 
 if [ $? -ne 0 ]; then
