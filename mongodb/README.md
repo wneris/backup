@@ -54,6 +54,7 @@ Esta configuração garante que o nó de backup não interfira na operação nor
 - **v6** (09/06/2026): Retenção local por quantidade — mantém apenas os 2 arquivos `.enc` mais recentes
 - **v7** (23/07/2026): `mongodump` com conexão direta no nó de backup (`host:porta`, sem discovery do replica set)
 - **v8** (23/07/2026): Dump resiliente — retry, databases explícitos e collections grandes em lotes por ObjectId
+- **v9** (23/07/2026): Mais retries (`15`), intervalo maior (`120s`) e mais lotes (`96`) para falhas no fim do dump
 
 ## Configurações
 
@@ -71,10 +72,10 @@ Esta configuração garante que o nó de backup não interfira na operação nor
 - **`BACKUP_DATABASES`**: `admin GARR_MONGO` - Databases incluídos no backup (lista explícita; o usuário de backup tipicamente não tem `listDatabases`)
 
 #### Dump resiliente
-- **`DUMP_MAX_RETRIES`**: `5` - Tentativas por lote/collection em caso de falha transitória
-- **`DUMP_RETRY_SLEEP_SEC`**: `60` - Espera entre retries (segundos)
+- **`DUMP_MAX_RETRIES`**: `15` - Tentativas por lote/collection em caso de falha transitória
+- **`DUMP_RETRY_SLEEP_SEC`**: `120` - Espera entre retries (segundos)
 - **`CHUNKED_COLLECTIONS`**: `loginAudit logRoot` - Collections dumpadas em lotes por faixa temporal de `_id` (ObjectId)
-- **`NUM_CHUNKS`**: `48` - Quantidade alvo de lotes por collection grande (aumentar se ainda ocorrer `Closed explicitly`)
+- **`NUM_CHUNKS`**: `96` - Quantidade alvo de lotes por collection grande (aumentar se ainda ocorrer `Closed explicitly`)
 - **`CHUNK_DOC_THRESHOLD`**: `10000000` - Reservado para auto-lote por contagem (estratégia atual força lote via `CHUNKED_COLLECTIONS`)
 
 #### Retenção
@@ -139,7 +140,7 @@ O dump **não** usa mais um único `mongodump` de todo o cluster. A estratégia 
 2. **`admin`**: `mongodump --db admin` completo (users/roles), com `--gzip` e `--numParallelCollections=1`
 3. **`GARR_MONGO`** (e demais DBs em `BACKUP_DATABASES`, exceto `admin`):
    - Dump base com `--excludeCollection` para cada collection em `CHUNKED_COLLECTIONS` (`loginAudit`, `logRoot`)
-   - Em seguida, cada collection grande é dumpada em **lotes por faixa temporal de ObjectId** (`NUM_CHUNKS`, padrão 48)
+   - Em seguida, cada collection grande é dumpada em **lotes por faixa temporal de ObjectId** (`NUM_CHUNKS`, padrão 96)
    - Cada lote/collection tem **retry** (`DUMP_MAX_RETRIES` / `DUMP_RETRY_SLEEP_SEC`)
    - Os `.bson` dos lotes são concatenados e compactados em `collection.bson.gz` + `collection.metadata.json`
 4. O shell `mongo` (`MONGO_BIN`) é usado apenas para calcular min/max `_id` e as faixas dos lotes (`--host` + `--port` separados, compatível com shell antigo)
@@ -227,14 +228,14 @@ Início do Backup: 2026-07-23 10:00:00
 Verificando espaço em disco disponível...
 [OK] Espaço em disco suficiente: 150GB disponível (mínimo: 70GB)
 Criando diretório local temporário: /backup/mongodb_temp
-Iniciando dump resiliente (conexão direta, 1 collection por vez, retry=5, lotes=48)...
+Iniciando dump resiliente (conexão direta, 1 collection por vez, retry=15, lotes=96)...
 Collections forçadas em lotes: loginAudit logRoot
 Databases: admin GARR_MONGO
 >>> Dump DB: admin
 [INFO] GARR_MONGO: dump base excluindo [loginAudit logRoot], depois lotes nas grandes
 >>> Dump DB: GARR_MONGO --excludeCollection loginAudit --excludeCollection logRoot
 Collection grande: GARR_MONGO.loginAudit
->>> Dump em lotes (_id/ObjectId): GARR_MONGO.loginAudit (48 faixas alvo)
+>>> Dump em lotes (_id/ObjectId): GARR_MONGO.loginAudit (96 faixas alvo)
     lote 1: _id >= ... < ...
 [OK] Lotes concluídos: GARR_MONGO.loginAudit
 [OK] Backup concluído localmente.
@@ -374,11 +375,12 @@ A rotina de backup é monitorada pelo **New Relic** para acompanhamento de:
 ### v6 (09/06/2026)
 1. ✅ Retenção local por quantidade (2 `.enc` mais recentes)
 
-### v7 / v8 (23/07/2026)
+### v7 / v8 / v9 (23/07/2026)
 1. ✅ Conexão direta no nó de backup
 2. ✅ Dump resiliente com retry
 3. ✅ Collections grandes (`loginAudit`, `logRoot`) em lotes por ObjectId
 4. ✅ Lista explícita de databases (`BACKUP_DATABASES`)
+5. ✅ Defaults mais agressivos: 15 retries, 120s entre tentativas, 96 lotes
 
 ## Melhorias Futuras Sugeridas
 

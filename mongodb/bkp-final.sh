@@ -8,6 +8,7 @@
 ## v6 - 09/06/2026 - retenção local por quantidade: apenas os 2 arquivos .enc mais recentes
 ## v7 - 23/07/2026 - mongodump com conexão direta no nó de backup e --numParallelCollections=1
 ## v8 - 23/07/2026 - dump por collection com retry; collections grandes em lotes por _id (ObjectId)
+## v9 - 23/07/2026 - aumenta retries/intervalo e NUM_CHUNKS para reduzir falha no fim dos lotes
 #
 #######################################################################################
 #set +x
@@ -34,11 +35,11 @@ LOG_MAX_SIZE_MB=100   # Tamanho máximo do log em MB antes de rotacionar
 LOG_BACKUP_COUNT=5    # Número de logs de backup a manter
 
 # Dump resiliente
-DUMP_MAX_RETRIES="${DUMP_MAX_RETRIES:-5}"
-DUMP_RETRY_SLEEP_SEC="${DUMP_RETRY_SLEEP_SEC:-60}"
+DUMP_MAX_RETRIES="${DUMP_MAX_RETRIES:-15}"
+DUMP_RETRY_SLEEP_SEC="${DUMP_RETRY_SLEEP_SEC:-120}"
 CHUNKED_COLLECTIONS="${CHUNKED_COLLECTIONS:-loginAudit logRoot}"
 CHUNK_DOC_THRESHOLD="${CHUNK_DOC_THRESHOLD:-10000000}"  # auto-chunk se estimated count >= este valor
-NUM_CHUNKS="${NUM_CHUNKS:-48}"  # lotes por faixa temporal de ObjectId
+NUM_CHUNKS="${NUM_CHUNKS:-96}"  # lotes por faixa temporal de ObjectId (mais lotes = faixas menores)
 BACKUP_DATABASES="${BACKUP_DATABASES:-admin GARR_MONGO}"  # fallback se listDatabases falhar
 # mongo shell antigo: --host e --port separados
 MONGO_HOST_ONLY="${MONGO_HOSTS%%:*}"
