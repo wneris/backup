@@ -44,6 +44,8 @@ rs.add({
 
 Esta configuração garante que o nó de backup não interfira na operação normal do cluster e sempre esteja disponível para realizar backups sem impacto na performance.
 
+**Importante**: o `bkp-final.sh` **roda neste nó** e o `mongodump` lê o `mongod` local (`10.250.50.114:37017`). Não descobre nem usa outros SECONDARY do replica set (diferente do script legado antigo, que escolhia qualquer SECONDARY via `rs.status()`).
+
 ## Versões
 
 - **v1** (16/12/2025): Redirecionamento de logs para `/var/log/mongodb_backup.log`
@@ -53,8 +55,9 @@ Esta configuração garante que o nó de backup não interfira na operação nor
 - **v5** (05/01/2025): Adicionado criptografia AES-256-CBC dos backups antes do upload ao S3
 - **v6** (09/06/2026): Retenção local por quantidade — mantém apenas os 2 arquivos `.enc` mais recentes
 - **v7** (23/07/2026): `mongodump` com conexão direta no nó de backup (`host:porta`, sem discovery do replica set)
-- **v8** (23/07/2026): Dump resiliente — retry, databases explícitos e collections grandes em lotes por ObjectId
-- **v9** (23/07/2026): Mais retries (`15`), intervalo maior (`120s`) e mais lotes (`96`) para falhas no fim do dump
+- **v8** (23/07/2026): Tentativa de dump em lotes por ObjectId (**revertido na v10**)
+- **v9** (23/07/2026): Tentativa de mais retries/lotes (**revertido na v10**)
+- **v10** (23/07/2026): Dump simples neste SECONDARY dedicado (estilo legado: `--host/--port/--db/--gzip`), sem lotes e sem ler outros nós
 
 ## Configurações
 
@@ -66,17 +69,14 @@ Esta configuração garante que o nó de backup não interfira na operação nor
 - **`REMOTE_HOST`**: `backup-server-ip` - Host do servidor de backup
 
 #### MongoDB
-- **`MONGO_HOSTS`**: `10.250.50.114:37017` - Host e porta do nó dedicado de backup (conexão direta)
-- **`MONGO_BIN`**: `/usr/bin/mongo` - Shell usado para calcular lotes de ObjectId (`--host` e `--port` separados)
+- **`MONGO_HOSTS`**: `10.250.50.114:37017` - Host/porta do `mongod` **neste** nó de backup (dump local)
+- **`MONGO_BIN`**: `/usr/bin/mongo` - Shell (ping/diagnóstico; `--host` e `--port` separados)
 - **`MONGODUMP_BIN`**: `/usr/bin/mongodump` - Binário do dump
-- **`BACKUP_DATABASES`**: `admin GARR_MONGO` - Databases incluídos no backup (lista explícita; o usuário de backup tipicamente não tem `listDatabases`)
+- **`BACKUP_DB`**: `GARR_MONGO` - Database dumpado (padrão do script legado)
 
-#### Dump resiliente
-- **`DUMP_MAX_RETRIES`**: `15` - Tentativas por lote/collection em caso de falha transitória
-- **`DUMP_RETRY_SLEEP_SEC`**: `120` - Espera entre retries (segundos)
-- **`CHUNKED_COLLECTIONS`**: `loginAudit logRoot` - Collections dumpadas em lotes por faixa temporal de `_id` (ObjectId)
-- **`NUM_CHUNKS`**: `96` - Quantidade alvo de lotes por collection grande (aumentar se ainda ocorrer `Closed explicitly`)
-- **`CHUNK_DOC_THRESHOLD`**: `10000000` - Reservado para auto-lote por contagem (estratégia atual força lote via `CHUNKED_COLLECTIONS`)
+#### Dump
+- **`DUMP_MAX_RETRIES`**: `3` - Tentativas do `mongodump` em caso de falha transitória
+- **`DUMP_RETRY_SLEEP_SEC`**: `60` - Espera entre retries (segundos)
 
 #### Retenção
 - **`RETENTION_ENCRYPTED_COUNT`**: `2` - Quantidade de arquivos `.tar.enc` a manter localmente
@@ -132,24 +132,27 @@ export AWS_SECRET_ACCESS_KEY="..."      # Chave secreta AWS
 6. Configura o redirecionamento de logs para `/var/log/mongodb_backup.log`
 7. **Verifica espaço em disco disponível** - Aborta se houver menos de 70GB disponíveis
 
-### 2. Execução do Backup (`mongodump` resiliente)
+### 2. Execução do Backup (`mongodump` neste SECONDARY)
 
-O dump **não** usa mais um único `mongodump` de todo o cluster. A estratégia atual é:
+O script **roda no nó dedicado** e faz um dump simples (estilo legado), lendo só o `mongod` local:
 
-1. **Conexão direta** em `MONGO_HOSTS` (`10.250.50.114:37017`) — sem prefixo de replica set / discovery (adequado ao nó `hidden`)
-2. **`admin`**: `mongodump --db admin` completo (users/roles), com `--gzip` e `--numParallelCollections=1`
-3. **`GARR_MONGO`** (e demais DBs em `BACKUP_DATABASES`, exceto `admin`):
-   - Dump base com `--excludeCollection` para cada collection em `CHUNKED_COLLECTIONS` (`loginAudit`, `logRoot`)
-   - Em seguida, cada collection grande é dumpada em **lotes por faixa temporal de ObjectId** (`NUM_CHUNKS`, padrão 96)
-   - Cada lote/collection tem **retry** (`DUMP_MAX_RETRIES` / `DUMP_RETRY_SLEEP_SEC`)
-   - Os `.bson` dos lotes são concatenados e compactados em `collection.bson.gz` + `collection.metadata.json`
-4. O shell `mongo` (`MONGO_BIN`) é usado apenas para calcular min/max `_id` e as faixas dos lotes (`--host` + `--port` separados, compatível com shell antigo)
+```bash
+mongodump --host 10.250.50.114 --port 37017 \
+  --db GARR_MONGO --username ... --password ... \
+  --authenticationDatabase ... \
+  --excludeCollection system.users \
+  --gzip --out ...
+```
+
+- **Não** usa `rs.status()` para escolher outro SECONDARY do cluster
+- **Não** faz dump em lotes por ObjectId
+- Retry configurável (`DUMP_MAX_RETRIES`) se o dump falhar de forma transitória
+- Compactação `--gzip` durante o dump
 
 **Nome do Backup**: `mongodb_dump_YYYYMMDD_HHMMSS` (timestamp)
 
-**Por quê**: collections como `loginAudit` (~centenas de milhões de docs) geravam `Closed explicitly` em dump monolítico (getMore com lock wait longo). Lotes menores + retry reduzem a chance de abortar o backup inteiro.
+**Nota**: O nó é `hidden` + `priority: 0` + `votes: 0`, para o backup não impactar o primário nem receber tráfego de aplicação.
 
-**Nota**: O backup é realizado no nó dedicado `mongodb-backup`, secundário oculto sem prioridade, sem interferir no primário.
 
 ### 3. Compactação
 
@@ -228,16 +231,10 @@ Início do Backup: 2026-07-23 10:00:00
 Verificando espaço em disco disponível...
 [OK] Espaço em disco suficiente: 150GB disponível (mínimo: 70GB)
 Criando diretório local temporário: /backup/mongodb_temp
-Iniciando dump resiliente (conexão direta, 1 collection por vez, retry=15, lotes=96)...
-Collections forçadas em lotes: loginAudit logRoot
-Databases: admin GARR_MONGO
->>> Dump DB: admin
-[INFO] GARR_MONGO: dump base excluindo [loginAudit logRoot], depois lotes nas grandes
->>> Dump DB: GARR_MONGO --excludeCollection loginAudit --excludeCollection logRoot
-Collection grande: GARR_MONGO.loginAudit
->>> Dump em lotes (_id/ObjectId): GARR_MONGO.loginAudit (96 faixas alvo)
-    lote 1: _id >= ... < ...
-[OK] Lotes concluídos: GARR_MONGO.loginAudit
+Iniciando dump neste nó SECONDARY dedicado (estilo legado)...
+Target: 10.250.50.114:37017 db=GARR_MONGO
+Nó de backup (SECONDARY dedicado): 10.250.50.114:37017
+>>> mongodump --host 10.250.50.114 --port 37017 --db GARR_MONGO --gzip
 [OK] Backup concluído localmente.
 ...
 ----------------------------------------------------
@@ -262,9 +259,8 @@ O script possui validações e tratamento de erros em pontos críticos:
 ### Ferramentas Necessárias
 
 - **`mongodump`**: Ferramenta do MongoDB para criação de backups (`/usr/bin/mongodump`)
-- **`mongo`**: Shell para calcular faixas de ObjectId dos lotes (`/usr/bin/mongo`; `--host` e `--port` separados)
+- **`mongo`**: Shell opcional para diagnóstico/ping (`/usr/bin/mongo`; `--host` e `--port` separados)
 - **`tar`**: Ferramenta de compactação
-- **`gzip`**: Compactação dos BSON concatenados dos lotes
 - **`openssl`**: Criptografia AES-256-CBC (arquivo de senha em `$SCRIPT_DIR/.openssl_pass`)
 - **`aws`**: CLI AWS (`/usr/local/bin/aws`) com credenciais no `.env`
 
@@ -273,7 +269,7 @@ O script possui validações e tratamento de erros em pontos críticos:
 - Leitura/escrita no diretório `/backup/mongodb_temp`
 - Escrita no arquivo de log `/var/log/mongodb_backup.log`
 - Leitura do arquivo de senha `$SCRIPT_DIR/.openssl_pass` (chmod 600)
-- Acesso de leitura ao MongoDB no nó de backup (databases em `BACKUP_DATABASES`)
+- Acesso de leitura ao MongoDB **neste** nó de backup (`BACKUP_DB`, padrão `GARR_MONGO`)
 - Permissões de escrita no bucket S3 `backup-mongodb-superbid`
 
 ## Descriptografia de Backups
@@ -344,19 +340,18 @@ A rotina de backup é monitorada pelo **New Relic** para acompanhamento de:
 ## Observações Importantes
 
 1. **Nó Dedicado de Backup**: secundário oculto (`hidden: true`, `priority: 0`, `votes: 0`) — nunca vira primário
-2. **Conexão direta**: o dump usa `host:porta` do nó de backup, sem discovery do replica set (evita ler outro secundário)
-3. **Dump em lotes**: `loginAudit` e `logRoot` são dumpadas em faixas de ObjectId com retry, mitigando `Closed explicitly` por lock wait / idle de conexão
-4. **Databases explícitos**: `BACKUP_DATABASES` (padrão `admin GARR_MONGO`) — não depende de `listDatabases`
-5. **Compactação Gzip**: aplicada no dump e nos BSON concatenados dos lotes
-6. **Criptografia**: AES-256-CBC antes do upload ao S3
-7. **Arquivo de Senha**: `$SCRIPT_DIR/.openssl_pass` com permissões restritas (chmod 600)
-8. **Retenção Local**: mantém apenas `RETENTION_ENCRYPTED_COUNT` (2) arquivos `.enc`
-9. **Retenção S3**: 7 dias via lifecycle do bucket
-10. **Verificação de Espaço**: mínimo 70GB antes de iniciar
-11. **Verificação de Integridade**: compara tamanho local vs S3 após o upload
-12. **Rotação de Logs**: acima de 100MB, mantém os últimos 5 arquivos
-13. **Monitoramento**: New Relic sobre `/var/log/mongodb_backup.log`
-14. **Segurança / Git**: `.env`, `.openssl_pass`, logs e backups no `.gitignore`
+2. **Script roda neste nó**: o `mongodump` lê o `mongod` local (`MONGO_HOSTS`), sem `rs.status()` e sem outros SECONDARY
+3. **Dump simples**: um `mongodump --db GARR_MONGO --gzip` (estilo legado), com retry leve
+4. **Compactação Gzip**: aplicada pelo próprio `mongodump` (`--gzip`)
+5. **Criptografia**: AES-256-CBC antes do upload ao S3
+6. **Arquivo de Senha**: `$SCRIPT_DIR/.openssl_pass` com permissões restritas (chmod 600)
+7. **Retenção Local**: mantém apenas `RETENTION_ENCRYPTED_COUNT` (2) arquivos `.enc`
+8. **Retenção S3**: 7 dias via lifecycle do bucket
+9. **Verificação de Espaço**: mínimo 70GB antes de iniciar
+10. **Verificação de Integridade**: compara tamanho local vs S3 após o upload
+11. **Rotação de Logs**: acima de 100MB, mantém os últimos 5 arquivos
+12. **Monitoramento**: New Relic sobre `/var/log/mongodb_backup.log`
+13. **Segurança / Git**: `.env`, `.openssl_pass`, logs e backups no `.gitignore`
 
 ## Melhorias Implementadas
 
@@ -375,12 +370,13 @@ A rotina de backup é monitorada pelo **New Relic** para acompanhamento de:
 ### v6 (09/06/2026)
 1. ✅ Retenção local por quantidade (2 `.enc` mais recentes)
 
-### v7 / v8 / v9 (23/07/2026)
-1. ✅ Conexão direta no nó de backup
-2. ✅ Dump resiliente com retry
-3. ✅ Collections grandes (`loginAudit`, `logRoot`) em lotes por ObjectId
-4. ✅ Lista explícita de databases (`BACKUP_DATABASES`)
-5. ✅ Defaults mais agressivos: 15 retries, 120s entre tentativas, 96 lotes
+### v7 / v10 (23/07/2026)
+1. ✅ Conexão direta neste nó de backup (`--host` / `--port`)
+2. ✅ Dump simples de `GARR_MONGO` com `--gzip` e retry
+3. ✅ Documentado que o script não lê outros SECONDARY do cluster
+
+### v8 / v9 (23/07/2026) — revertidas
+1. ⚠️ Lotes por ObjectId e retries agressivos foram tentados e **removidos na v10** (não fazem parte do comportamento atual)
 
 ## Melhorias Futuras Sugeridas
 
